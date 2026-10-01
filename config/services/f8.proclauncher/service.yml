@@ -8,4 +8,4 @@ launch:
   - -m
   - f8proclauncher.main
   env: {}
-  workdir: ../../..
+  workdir: ${F8_PACKAGE_ROOT}
