@@ -11,7 +11,7 @@
       ],
       "runtime": {
         "kind": "workspace",
-        "environment": "default"
+        "environment": "proclauncher"
       }
     }
   ]

@@ -18,3 +18,9 @@ f8proclauncher = {path = ".", editable = true}
 
 [tasks]
 check = "python -m f8pysdk.extension_packaging --check"
+
+[tasks.f8proclauncher]
+cmd = "python -m f8proclauncher.main"
+
+[environments]
+proclauncher = []
