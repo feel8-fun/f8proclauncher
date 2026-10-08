@@ -20,6 +20,8 @@ def register_proclauncher_specs(registry: Registry) -> Registry:
             rendererClass="default_svc",
             stateFields=[
                 F8StateSpec(
+                    persistent=True,
+                    publishable=False,
                     name="programPath",
                     label="Program Path",
                     description="Executable path or command line (quoted if it contains spaces). Cleared when exporting publish JSON.",
