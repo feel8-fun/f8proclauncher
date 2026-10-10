@@ -8,14 +8,15 @@ import os
 import platform
 import shlex
 import shutil
-import signal
 import subprocess
 import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
+from f8pysdk.codec import parse_bool
+from f8pysdk.time_utils import now_ms as _now_ms
+from f8pysdk.process_control import is_pid_running as _is_pid_running, terminate_pid as _terminate_pid
 from f8pysdk.capabilities import ClosableNode
 from f8pysdk.specs import F8RuntimeNode
 from f8pysdk.f8_naming import ensure_token
@@ -33,22 +34,8 @@ def _is_windows() -> bool:
     return platform.system().lower().startswith("win")
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
 def _coerce_bool(value: Any) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and value in (0, 1):
-        return bool(value)
-    if isinstance(value, str):
-        s = value.strip().lower()
-        if s in {"1", "true", "yes", "on"}:
-            return True
-        if s in {"0", "false", "no", "off"}:
-            return False
-    return None
+    return parse_bool(value, strict_numeric=True)
 
 
 def _split_command_line(raw: str) -> list[str]:
@@ -68,7 +55,8 @@ def _resolve_executable(exe: str) -> str:
     if p.exists():
         try:
             return str(p.resolve())
-        except OSError:
+        except OSError as exc:
+            logger.warning("Cannot resolve program path %s", p, exc_info=exc)
             return str(p)
     hit = shutil.which(expanded)
     if hit:
@@ -107,7 +95,7 @@ def _read_pid_record(path: Path) -> _PidRecord | None:
         obj = json.loads(raw)
     except FileNotFoundError:
         return None
-    except Exception as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         logger.debug("pidfile parse failed: %s", path, exc_info=exc)
         return None
 
@@ -131,94 +119,15 @@ def _write_pid_record(path: Path, record: _PidRecord) -> None:
             json.dumps({"pid": int(record.pid), "argv": list(record.argv), "created_ts_ms": int(record.created_ts_ms)}),
             encoding="utf-8",
         )
-    except Exception as exc:
+    except OSError as exc:
         logger.debug("pidfile write failed: %s", path, exc_info=exc)
 
 
 def _remove_pidfile(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
-    except Exception as exc:
+    except OSError as exc:
         logger.debug("pidfile unlink failed: %s", path, exc_info=exc)
-
-
-def _is_pid_running(pid: int) -> bool:
-    if int(pid) <= 0:
-        return False
-    if _is_windows():
-        try:
-            proc = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                check=False,
-            )
-        except OSError:
-            return False
-        out = (proc.stdout or "").strip()
-        if not out or out.lower().startswith("info:"):
-            return False
-        return f"\"{int(pid)}\"" in out or f",{int(pid)}," in out
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
-def _terminate_pid(pid: int, *, timeout_s: float = 2.0) -> bool:
-    target_pid = int(pid)
-    if target_pid <= 0:
-        return True
-    if not _is_pid_running(target_pid):
-        return True
-
-    if _is_windows():
-        try:
-            proc = subprocess.run(
-                ["taskkill", "/PID", str(target_pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except OSError:
-            return False
-        if int(proc.returncode) == 0:
-            return True
-        return not _is_pid_running(target_pid)
-
-    try:
-        os.kill(target_pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return True
-    except OSError as exc:
-        logger.debug("SIGTERM failed pid=%s error_type=%s", target_pid, type(exc).__name__, exc_info=exc)
-
-    deadline = time.monotonic() + max(0.1, float(timeout_s))
-    while time.monotonic() < deadline:
-        if not _is_pid_running(target_pid):
-            return True
-        time.sleep(0.05)
-
-    try:
-        os.kill(target_pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return True
-    except OSError as exc:
-        logger.debug("SIGKILL failed pid=%s error_type=%s", target_pid, type(exc).__name__, exc_info=exc)
-        return not _is_pid_running(target_pid)
-
-    deadline_kill = time.monotonic() + max(0.1, float(timeout_s))
-    while time.monotonic() < deadline_kill:
-        if not _is_pid_running(target_pid):
-            return True
-        time.sleep(0.05)
-    return not _is_pid_running(target_pid)
 
 
 class ProcLauncherServiceNode(ServiceNode, ClosableNode):
@@ -377,10 +286,12 @@ class ProcLauncherServiceNode(ServiceNode, ClosableNode):
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
         try:
             proc = subprocess.Popen([str(x) for x in argv], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, creationflags=creationflags, start_new_session=detached and not _is_windows())
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
+            logger.exception("Program not found argv=%s", argv, exc_info=exc)
             self._log_once(f"program not found argv={argv!r}", sig=f"spawn:fnf:{argv!r}", level="error")
             return
         except OSError as exc:
+            logger.exception("Spawn failed argv=%s", argv, exc_info=exc)
             self._log_once(
                 f"spawn failed argv={argv!r} err={type(exc).__name__}:{exc}",
                 sig=f"spawn:os:{argv!r}:{type(exc).__name__}",
@@ -419,13 +330,19 @@ class ProcLauncherServiceNode(ServiceNode, ClosableNode):
         if pid is None:
             return
 
-        ok = await asyncio.to_thread(_terminate_pid, pid)
+        try:
+            ok = await asyncio.to_thread(_terminate_pid, pid)
+            if ok and proc is not None:
+                await asyncio.to_thread(proc.wait, timeout=2.0)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.exception("Process stop failed pid=%s reason=%s", pid, reason, exc_info=exc)
+            ok = False
         if ok:
             logger.info("stopped pid=%s reason=%s", pid, reason)
         else:
             logger.warning("stop failed pid=%s reason=%s", pid, reason)
 
-        if self._pidfile is not None:
+        if ok and self._pidfile is not None:
             _remove_pidfile(self._pidfile)
 
     def _log_once(self, message: str, *, sig: str, level: str) -> None:
